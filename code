@@ -1,0 +1,330 @@
+// AquaGuard - Leak detection with two flow sensors + Blynk notifications
+// Flow Sensor 1 (inlet)  -> GPIO 26
+// Flow Sensor 2 (outlet) -> GPIO 27
+// LCD SDA                -> GPIO 16
+// LCD SCL                -> GPIO 17
+// White LED -> GPIO 32 (Normal)     Red LED -> GPIO 25 (Critical)
+// Buzzer (active)        -> GPIO 21
+// Relay IN (valve)       -> GPIO 22
+// Reset button           -> GPIO 4 and GND
+//
+// ---------------- BLYNK SETUP (do this first) ----------------
+// 1. In Blynk Console create a Template (hardware: ESP32, connection: WiFi).
+// 2. Add Datastreams (Virtual Pins):
+//      V0  Flow Inlet     (Double, L/min)
+//      V1  Flow Outlet    (Double, L/min)
+//      V2  Loss %         (Double, %)
+//      V3  Status         (String)
+//      V4  Reset Button   (Integer 0-1)   <- button widget, mode: Push
+// 3. Template > Events > Add Event:
+//      Name: Leak Detected   Code: leak_detected   Type: Critical
+//      Enable notifications (Push / Email) for it.
+// 4. Create a Device from the template, copy the Template ID, Template Name
+//    and Auth Token into the three defines below.
+// 5. In the mobile app add widgets: Gauges (V0, V1, V2), Label (V3), Button (V4).
+// ---------------------------------------------------------------
+
+// ===== Fill these in from the Blynk console =====
+#define BLYNK_TEMPLATE_ID   "TMPL3uaazdH26"
+#define BLYNK_TEMPLATE_NAME "Aquaguard"
+#define BLYNK_AUTH_TOKEN    "nQ1eEHYOE6cwpy_5CKGrQ2wxKUna_skM"
+
+// ===== WiFi =====
+const char* WIFI_SSID = "..";
+const char* WIFI_PASS = "........";
+
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+#define FLOW1_PIN 26
+#define FLOW2_PIN 27
+#define SDA_PIN   16
+#define SCL_PIN   17
+
+#define LED_WHITE 32   // normal
+#define LED_RED   25   // critical
+
+#define BUZZER_PIN 21
+#define VALVE_PIN  22
+#define RESET_PIN  4
+
+// Most relay modules are active-LOW (LOW = relay ON). Set false if yours is active-HIGH.
+#define RELAY_ACTIVE_LOW true
+
+#define LCD_ADDR  0x27   // change to 0x3F if the LCD stays blank
+#define LCD_COLS  16
+#define LCD_ROWS  2
+
+// ---------------- SETTINGS (tune these) ----------------
+#define S2_CAL         1.30
+#define CRIT_PCT       15.0
+#define MIN_FLOW        0.5
+#define CRIT_CONFIRM    3
+#define STARTUP_IGNORE_MS 6000
+#define AVG_SECONDS     5
+#define MIN_PULSE_GAP_US 3000
+
+// Blynk virtual pins
+#define VP_FLOW1   V0
+#define VP_FLOW2   V1
+#define VP_LOSS    V2
+#define VP_STATUS  V3
+#define VP_RESET   V4
+
+#define BLYNK_RETRY_MS 10000   // how often to retry connecting if offline
+// -------------------------------------------------------
+
+enum Status { NORMAL, CRITICAL };
+
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+
+volatile unsigned long pulseCount1 = 0;
+volatile unsigned long pulseCount2 = 0;
+volatile unsigned long lastPulseUs1 = 0;
+volatile unsigned long lastPulseUs2 = 0;
+
+unsigned long lastTime = 0;
+Status prevStatus = NORMAL;
+Status currentStatus = NORMAL;
+bool criticalLatched = false;
+int critCount = 0;
+
+float hist1[AVG_SECONDS], hist2[AVG_SECONDS];
+int histIdx = 0, histFilled = 0;
+
+float flowRate1 = 0;
+float flowRate2 = 0;
+float lossPct = 0;
+
+// Blynk state
+bool leakNotifyPending = false;     // true until the leak notification has been sent
+volatile bool appResetRequest = false;
+unsigned long lastBlynkTry = 0;
+
+void IRAM_ATTR flow1Pulse() {
+  unsigned long now = micros();
+  if (now - lastPulseUs1 >= MIN_PULSE_GAP_US) {
+    pulseCount1++;
+    lastPulseUs1 = now;
+  }
+}
+
+void IRAM_ATTR flow2Pulse() {
+  unsigned long now = micros();
+  if (now - lastPulseUs2 >= MIN_PULSE_GAP_US) {
+    pulseCount2++;
+    lastPulseUs2 = now;
+  }
+}
+
+// Reset button in the Blynk app (V4)
+BLYNK_WRITE(VP_RESET) {
+  if (param.asInt() == 1) appResetRequest = true;
+}
+
+// Re-sync state when (re)connected
+BLYNK_CONNECTED() {
+  Blynk.virtualWrite(VP_STATUS, criticalLatched ? "LEAK - VALVE CLOSED" : "NORMAL");
+}
+
+void setStatusLeds(Status s) {
+  digitalWrite(LED_WHITE, s == NORMAL   ? HIGH : LOW);
+  digitalWrite(LED_RED,   s == CRITICAL ? HIGH : LOW);
+}
+
+void updateBuzzer() {
+  digitalWrite(BUZZER_PIN, currentStatus == CRITICAL ? HIGH : LOW);
+}
+
+// Valve is normally-closed: relay ON = valve OPEN. CRITICAL -> relay OFF -> valve CLOSES.
+void setValve(bool open) {
+  if (RELAY_ACTIVE_LOW) {
+    if (open) {
+      pinMode(VALVE_PIN, OUTPUT);
+      digitalWrite(VALVE_PIN, LOW);
+    } else {
+      pinMode(VALVE_PIN, INPUT);
+    }
+  } else {
+    pinMode(VALVE_PIN, OUTPUT);
+    digitalWrite(VALVE_PIN, open ? HIGH : LOW);
+  }
+}
+
+// Keeps WiFi/Blynk alive WITHOUT ever blocking the leak protection.
+void handleBlynk() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastBlynkTry > BLYNK_RETRY_MS) {
+      lastBlynkTry = millis();
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+    return;
+  }
+
+  if (Blynk.connected()) {
+    Blynk.run();
+  } else if (millis() - lastBlynkTry > BLYNK_RETRY_MS) {
+    lastBlynkTry = millis();
+    Blynk.connect(3000);   // max 3 s attempt
+  }
+}
+
+// Send the leak alert once Blynk is reachable (retries automatically if offline)
+void sendLeakNotification() {
+  if (leakNotifyPending && Blynk.connected()) {
+    Blynk.logEvent("leak_detected",
+                   String("Leak detected! Loss ") + String(lossPct, 0) +
+                   "%. Water valve has been CLOSED.");
+    leakNotifyPending = false;
+    Serial.println("Blynk: leak notification sent");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(FLOW1_PIN, INPUT_PULLUP);
+  pinMode(FLOW2_PIN, INPUT_PULLUP);
+
+  pinMode(LED_WHITE, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  digitalWrite(BUZZER_PIN, LOW);
+  setValve(true);
+  setStatusLeds(NORMAL);
+
+  attachInterrupt(digitalPinToInterrupt(FLOW1_PIN), flow1Pulse, RISING);
+  attachInterrupt(digitalPinToInterrupt(FLOW2_PIN), flow2Pulse, RISING);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("AquaGuard");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+
+  // Non-blocking WiFi / Blynk start: the detector works even if WiFi is down
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  lastBlynkTry = millis();
+
+  delay(1500);
+  lcd.clear();
+
+  Serial.println("AquaGuard Leak Detector (Blynk)");
+  Serial.println("--------------------------");
+
+  lastTime = millis();
+}
+
+void loop() {
+
+  handleBlynk();
+  updateBuzzer();
+
+  // Physical reset button OR Blynk app reset button clears the latch
+  if (digitalRead(RESET_PIN) == LOW || appResetRequest) {
+    if (criticalLatched && Blynk.connected()) {
+      Blynk.virtualWrite(VP_STATUS, "NORMAL");
+    }
+    criticalLatched = false;
+    leakNotifyPending = false;
+    critCount = 0;
+    appResetRequest = false;
+  }
+
+  unsigned long elapsed = millis() - lastTime;
+  if (elapsed >= 1000) {
+
+    noInterrupts();
+    unsigned long pulses1 = pulseCount1;
+    unsigned long pulses2 = pulseCount2;
+    pulseCount1 = 0;
+    pulseCount2 = 0;
+    interrupts();
+
+    hist1[histIdx] = pulses1 * 1000.0 / elapsed;
+    hist2[histIdx] = pulses2 * 1000.0 / elapsed;
+    histIdx = (histIdx + 1) % AVG_SECONDS;
+    if (histFilled < AVG_SECONDS) histFilled++;
+
+    float sum1 = 0, sum2 = 0;
+    for (int i = 0; i < histFilled; i++) { sum1 += hist1[i]; sum2 += hist2[i]; }
+
+    flowRate1 = (sum1 / histFilled) / 7.5;
+    float flow2Raw = (sum2 / histFilled) / 7.5;
+    flowRate2 = flow2Raw * S2_CAL;
+
+    float diff   = fabs(flowRate1 - flowRate2);
+    float bigger = (flowRate1 > flowRate2) ? flowRate1 : flowRate2;
+    lossPct = (bigger >= MIN_FLOW) ? (diff / bigger * 100.0) : 0.0;
+
+    bool leak = (millis() > STARTUP_IGNORE_MS) && (lossPct >= CRIT_PCT);
+
+    if (leak) critCount++;
+    else      critCount = 0;
+
+    // Newly latched -> schedule ONE notification
+    if (critCount >= CRIT_CONFIRM && !criticalLatched) {
+      criticalLatched = true;
+      leakNotifyPending = true;
+    }
+
+    Status status = criticalLatched ? CRITICAL : NORMAL;
+
+    setValve(!criticalLatched);
+    setStatusLeds(status);
+    currentStatus = status;
+
+    // ---- Blynk: notification + dashboard data ----
+    sendLeakNotification();
+    if (Blynk.connected()) {
+      Blynk.virtualWrite(VP_FLOW1, flowRate1);
+      Blynk.virtualWrite(VP_FLOW2, flowRate2);
+      Blynk.virtualWrite(VP_LOSS, lossPct);
+      Blynk.virtualWrite(VP_STATUS, criticalLatched ? "LEAK - VALVE CLOSED" : "NORMAL");
+    }
+
+    if (status != prevStatus || status == CRITICAL) {
+      delay(20);
+      lcd.init();
+      lcd.backlight();
+      prevStatus = status;
+    }
+
+    const char* statusTxt = (status == NORMAL) ? "NORM" : "CRIT";
+
+    Serial.print("Raw pulses/s: ");  Serial.print(pulses1);  Serial.print(" , ");  Serial.println(pulses2);
+    Serial.print("Flow 1: ");           Serial.print(flowRate1);  Serial.println(" L/min");
+    Serial.print("Flow 2 (raw): ");     Serial.print(flow2Raw);   Serial.println(" L/min");
+    Serial.print("Flow 2 (corrected): "); Serial.print(flowRate2); Serial.println(" L/min");
+    Serial.print("Loss: ");  Serial.print(lossPct, 1);  Serial.println(" %");
+    Serial.print("WiFi: ");  Serial.print(WiFi.status() == WL_CONNECTED ? "OK" : "OFF");
+    Serial.print("  Blynk: "); Serial.println(Blynk.connected() ? "OK" : "OFF");
+    Serial.print("Status: ");
+    Serial.println(status == NORMAL ? "NORMAL" : "CRITICAL");
+    if (criticalLatched) Serial.println("LATCHED: valve closed. Press reset button (GPIO 4 to GND) or the app Reset button.");
+    Serial.println("--------------------------");
+
+    char line[17];
+
+    snprintf(line, sizeof(line), "S1:%5.2fL/m %4s", flowRate1, statusTxt);
+    lcd.setCursor(0, 0);
+    lcd.print(line);
+
+    snprintf(line, sizeof(line), "S2:%5.2fL/m %3.0f%%", flowRate2, lossPct);
+    lcd.setCursor(0, 1);
+    lcd.print(line);
+
+    lastTime = millis();
+  }
+}
